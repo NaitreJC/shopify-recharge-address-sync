@@ -1,10 +1,7 @@
 const crypto = require("crypto");
-const { Resend } = require("resend");
 
 const SHOPIFY_SHOP_DOMAIN = "alpherco.myshopify.com";
-const RECHARGE_API_VERSION = "2021-11";
-const FAILURE_EMAIL_TO = "care@naitre.com";
-const FAILURE_EMAIL_FROM = "Recharge Sync <onboarding@resend.dev>";
+const KLAVIYO_API_REVISION = "2025-01-15";
 
 function getEnv(name) {
   const value = process.env[name];
@@ -75,113 +72,75 @@ function hasUsableAddress(address) {
   );
 }
 
-async function rechargeRequest(path, options = {}) {
-  const rechargeToken = getEnv("RECHARGE_API_TOKEN");
+async function sendKlaviyoEvent(customer, shopifyAddress) {
+  const klaviyoPrivateApiKey = getEnv("KLAVIYO_PRIVATE_API_KEY");
 
-  const response = await fetch(`https://api.rechargeapps.com${path}`, {
-    ...options,
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      "X-Recharge-Access-Token": rechargeToken,
-      "x-recharge-version": RECHARGE_API_VERSION,
-      ...(options.headers || {})
+  const payload = {
+    data: {
+      type: "event",
+      attributes: {
+        properties: {
+          shopify_customer_id: String(customer.id),
+          shopify_address_id: customer.default_address
+            ? String(customer.default_address.id || "")
+            : "",
+          address1: shopifyAddress.address1,
+          address2: shopifyAddress.address2,
+          city: shopifyAddress.city,
+          province: shopifyAddress.province,
+          zip: shopifyAddress.zip,
+          country_code: shopifyAddress.country_code
+        },
+        metric: {
+          data: {
+            type: "metric",
+            attributes: {
+              name: "Shopify Address Updated"
+            }
+          }
+        },
+        profile: {
+          data: {
+            type: "profile",
+            attributes: {
+              email: customer.email,
+              first_name: customer.first_name || shopifyAddress.first_name || "",
+              last_name: customer.last_name || shopifyAddress.last_name || "",
+              properties: {
+                shopify_customer_id: String(customer.id),
+                last_shopify_address_update_source: "Shopify webhook"
+              }
+            }
+          }
+        }
+      }
     }
+  };
+
+  const response = await fetch("https://a.klaviyo.com/api/events", {
+    method: "POST",
+    headers: {
+      Authorization: `Klaviyo-API-Key ${klaviyoPrivateApiKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      revision: KLAVIYO_API_REVISION
+    },
+    body: JSON.stringify(payload)
   });
 
   const responseText = await response.text();
 
-  let data = null;
-  try {
-    data = responseText ? JSON.parse(responseText) : null;
-  } catch {
-    data = { raw: responseText };
-  }
-
   if (!response.ok) {
-    const error = new Error(`Recharge API error ${response.status}`);
-    error.status = response.status;
-    error.data = data;
+    const error = new Error(`Klaviyo API error ${response.status}`);
+    error.data = responseText;
     throw error;
   }
 
-  return data;
-}
-
-async function findRechargeCustomerByEmail(email) {
-  const encodedEmail = encodeURIComponent(email);
-  const data = await rechargeRequest(`/customers?email=${encodedEmail}`, {
-    method: "GET"
-  });
-
-  const customers = data.customers || [];
-
-  if (customers.length === 0) {
-    return null;
-  }
-
-  return customers[0];
-}
-
-async function findFirstRechargeAddress(customerId) {
-  const data = await rechargeRequest(`/addresses?customer_id=${customerId}`, {
-    method: "GET"
-  });
-
-  const addresses = data.addresses || [];
-
-  if (addresses.length === 0) {
-    return null;
-  }
-
-  const activeAddress =
-    addresses.find((address) => String(address.status || "").toUpperCase() === "ACTIVE") ||
-    addresses[0];
-
-  return activeAddress;
-}
-
-async function updateRechargeAddress(addressId, shopifyAddress) {
-  const payload = {
-    address1: shopifyAddress.address1,
-    address2: shopifyAddress.address2,
-    city: shopifyAddress.city,
-    province: shopifyAddress.province,
-    zip: shopifyAddress.zip,
-    country_code: shopifyAddress.country_code,
-    first_name: shopifyAddress.first_name,
-    last_name: shopifyAddress.last_name,
-    company: shopifyAddress.company,
-    phone: shopifyAddress.phone
-  };
-
-  return rechargeRequest(`/addresses/${addressId}`, {
-    method: "PUT",
-    body: JSON.stringify(payload)
-  });
-}
-
-async function sendFailureEmail(subject, details) {
-  const resendApiKey = process.env.RESEND_API_KEY;
-
-  if (!resendApiKey) {
-    console.error("RESEND_API_KEY not set. Failure email not sent.", details);
-    return;
-  }
-
-  const resend = new Resend(resendApiKey);
-
-  await resend.emails.send({
-    from: FAILURE_EMAIL_FROM,
-    to: FAILURE_EMAIL_TO,
-    subject,
-    text: details
-  });
+  return responseText;
 }
 
 async function handleWebhook(req, res) {
   const shopifyWebhookSecret = getEnv("SHOPIFY_WEBHOOK_SECRET");
-
   const rawBody = await readRawBody(req);
 
   const hmacHeader = req.headers["x-shopify-hmac-sha256"];
@@ -228,59 +187,30 @@ async function handleWebhook(req, res) {
       return;
     }
 
-    const rechargeCustomer = await findRechargeCustomerByEmail(customer.email);
+    await sendKlaviyoEvent(customer, shopifyAddress);
 
-    if (!rechargeCustomer) {
-      res.status(200).json({ ok: true, skipped: "No matching Recharge customer found" });
-      return;
-    }
-
-    const rechargeAddress = await findFirstRechargeAddress(rechargeCustomer.id);
-
-    if (!rechargeAddress) {
-      res.status(200).json({ ok: true, skipped: "No Recharge address found" });
-      return;
-    }
-
-    await updateRechargeAddress(rechargeAddress.id, shopifyAddress);
-
-    console.log("Recharge address synced", {
+    console.log("Klaviyo event sent", {
+      event: "Shopify Address Updated",
       shopifyCustomerId: customer.id,
       email: customer.email,
-      rechargeCustomerId: rechargeCustomer.id,
-      rechargeAddressId: rechargeAddress.id,
       webhookId
     });
 
     res.status(200).json({
       ok: true,
-      synced: true,
-      rechargeCustomerId: rechargeCustomer.id,
-      rechargeAddressId: rechargeAddress.id
+      sentToKlaviyo: true
     });
   } catch (error) {
-    const details = [
-      "Shopify to Recharge address sync failed.",
-      "",
-      `Shopify shop: ${shopDomain}`,
-      `Webhook topic: ${topic}`,
-      `Webhook ID: ${webhookId || "Not supplied"}`,
-      `Shopify customer ID: ${customer && customer.id ? customer.id : "Unknown"}`,
-      `Customer email: ${customer && customer.email ? customer.email : "Unknown"}`,
-      "",
-      `Error: ${error.message}`,
-      "",
-      "Recharge response:",
-      JSON.stringify(error.data || {}, null, 2)
-    ].join("\n");
-
-    console.error(details);
-
-    await sendFailureEmail("Recharge address sync failed", details);
+    console.error("Shopify address update Klaviyo event failed", {
+      message: error.message,
+      data: error.data || null,
+      customerEmail: customer && customer.email ? customer.email : null,
+      webhookId
+    });
 
     res.status(200).json({
       ok: true,
-      synced: false,
+      sentToKlaviyo: false,
       errorLogged: true
     });
   }
